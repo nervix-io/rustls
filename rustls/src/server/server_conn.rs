@@ -242,6 +242,39 @@ impl<'a> ClientHello<'a> {
     }
 }
 
+/// Selects an immutable cryptographic configuration snapshot for one new server connection.
+///
+/// A resolver is trusted configuration code. It runs once, before the connection consumes
+/// configuration. The snapshot must preserve every template field except its crypto provider
+/// and resolver: certificates, trust, ALPN, protocol versions and resumption stay unchanged.
+/// Established connections retain their selected configuration. Returning a configuration with
+/// another resolver does not resolve recursively for the same connection.
+pub trait ResolvesServerConfig: Debug + Send + Sync {
+    /// Choose the configuration for this connection, or refuse connection construction.
+    fn resolve(&self, template: &Arc<ServerConfig>) -> Result<Arc<ServerConfig>, Error>;
+
+    /// Make the resolver for a cloned configuration. A cache keyed by the template must start
+    /// fresh, because the caller may change ALPN, trust or another field on that clone.
+    fn clone_for_config(&self) -> Arc<dyn ResolvesServerConfig>;
+}
+
+/// A connection configuration resolver whose clone gets its own template-scoped cache.
+#[derive(Debug)]
+pub struct ServerConfigResolver(Arc<dyn ResolvesServerConfig>);
+
+impl ServerConfigResolver {
+    /// Wrap a resolver for this configuration template.
+    pub fn new(resolver: Arc<dyn ResolvesServerConfig>) -> Self {
+        Self(resolver)
+    }
+}
+
+impl Clone for ServerConfigResolver {
+    fn clone(&self) -> Self {
+        Self(self.0.clone_for_config())
+    }
+}
+
 /// Common configuration for a set of server sessions.
 ///
 /// Making one of these is cheap, though one of the inputs may be expensive: gathering trust roots
@@ -295,6 +328,11 @@ impl<'a> ClientHello<'a> {
 /// [`ServerSessionMemoryCache`]: crate::server::handy::ServerSessionMemoryCache
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
+    /// Optional connection-time configuration selection. The default is absent.
+    ///
+    /// A selected configuration is captured once and stays with its connection.
+    pub handshake_config_resolver: Option<ServerConfigResolver>,
+
     /// Source of randomness and other crypto.
     pub(super) provider: Arc<CryptoProvider>,
 
@@ -565,6 +603,31 @@ impl ServerConfig {
     /// Return the crypto provider used to construct this client configuration.
     pub fn crypto_provider(&self) -> &Arc<CryptoProvider> {
         &self.provider
+    }
+
+    /// Replace the cryptographic provider while preserving this configuration's trust,
+    /// identities, protocol versions, ALPN, resumption and other settings.
+    ///
+    /// The ordinary builder validates the replacement against the enabled protocol versions.
+    /// The returned snapshot has no resolver, so it can be cached without retaining its template.
+    pub fn with_crypto_provider(mut self, provider: Arc<CryptoProvider>) -> Result<Self, Error> {
+        let versions: Vec<_> = versions::ALL_VERSIONS
+            .iter()
+            .copied()
+            .filter(|version| self.versions.contains(version.version))
+            .collect();
+        let _validated = Self::builder_with_details(provider.clone(), self.time_provider.clone())
+            .with_protocol_versions(&versions)?;
+        self.provider = provider;
+        self.handshake_config_resolver = None;
+        Ok(self)
+    }
+
+    fn for_connection(config: Arc<Self>) -> Result<Arc<Self>, Error> {
+        match &config.handshake_config_resolver {
+            Some(resolver) => resolver.0.resolve(&config),
+            None => Ok(config),
+        }
     }
 
     /// We support a given TLS version if it's quoted in the configured
@@ -1061,6 +1124,8 @@ impl Accepted {
         mut self,
         config: Arc<ServerConfig>,
     ) -> Result<ServerConnection, (Error, AcceptedAlert)> {
+        let config = ServerConfig::for_connection(config)
+            .map_err(|error| (error, AcceptedAlert::empty()))?;
         if let Err(err) = self
             .connection
             .set_max_fragment_size(config.max_fragment_size)
@@ -1223,6 +1288,7 @@ impl ConnectionCore<ServerConnectionData> {
         config: Arc<ServerConfig>,
         extra_exts: ServerExtensionsInput<'static>,
     ) -> Result<Self, Error> {
+        let config = ServerConfig::for_connection(config)?;
         let mut common = CommonState::new(Side::Server);
         common.set_max_fragment_size(config.max_fragment_size)?;
         common.enable_secret_extraction = config.enable_secret_extraction;

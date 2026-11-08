@@ -55,6 +55,8 @@ use common::*;
 use provider::cipher_suite;
 use provider::sign::RsaSigningKey;
 
+mod configuration_refresh;
+
 mod test_raw_keys {
     use super::*;
 
