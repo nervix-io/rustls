@@ -104,6 +104,7 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
         let require_ems = self.provider.fips();
 
         ServerConfig {
+            handshake_config_resolver: None,
             provider: self.provider,
             verifier: self.state.verifier,
             cert_resolver,

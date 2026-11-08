@@ -166,6 +166,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
         let require_ems = self.provider.fips();
 
         ClientConfig {
+            handshake_config_resolver: None,
             provider: self.provider,
             alpn_protocols: Vec::new(),
             check_selected_alpn: true,
